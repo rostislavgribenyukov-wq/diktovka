@@ -5,7 +5,7 @@
 
 import os, sys, json, time, math, struct, threading, subprocess, traceback
 
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 REPO = "rostislavgribenyukov-wq/diktovka"   # отсюда скачиваются обновления
 PLATFORM = "mac" if sys.platform == "darwin" else "win"
 
@@ -873,6 +873,17 @@ class App:
         from concurrent.futures import ThreadPoolExecutor
         self.pool = ThreadPoolExecutor(max_workers=1)
         self._jobs, self._acc, self._done, self._streamer = [], "", 0, None
+        self._gen = 0  # номер записи: отложенное скрытие плашки не трогает уже начавшуюся новую запись
+
+    def _hide_later(self, sec):
+        gen = self._gen
+
+        def go():
+            if gen == self._gen and not self.recording and not self.busy:
+                self.ui.hide_panel()
+        t = threading.Timer(sec, go)
+        t.daemon = True
+        t.start()
 
     # --- распознавание кусками во время речи ---
     def _submit(self, audio):
@@ -970,6 +981,7 @@ class App:
         self.chunks = []
         self._peak = 0.0
         self._jobs, self._acc, self._done = [], "", 0
+        self._gen += 1
 
         def cb(indata, frames, t, status):
             import numpy as np
@@ -984,7 +996,7 @@ class App:
         except Exception as e:
             log("микрофон:", e)
             self.ui.say("Нет микрофона — проверьте разрешения в настройках системы", "red")
-            threading.Timer(5, self.ui.hide_panel).start()
+            self._hide_later(5)
             return
         self.recording = True
         log("запись началась")
@@ -1027,14 +1039,14 @@ class App:
                 audio = (audio / peak * 0.98).astype("float32")
             if len(audio) < 16000 * 0.3:
                 self.ui.say("Пусто – ничего не записалось")
-                threading.Timer(2.5, self.ui.hide_panel).start()
+                self._hide_later(2.5)
                 return
             # защита от галлюцинаций модели на тишине: без речи распознавание не запускаем
             speech = trim_silence(audio)
             if len(speech) < int(16000 * 0.4) or float(np.abs(speech).max()) < 0.05:
                 log("нет речи — распознавание пропущено")
                 self.ui.say("Не расслышал — зажмите клавишу и говорите чуть дольше")
-                threading.Timer(3, self.ui.hide_panel).start()
+                self._hide_later(3)
                 return
             self.ui.say("Распознаю…", "blue", level=1.0)
             t0 = time.time()
@@ -1046,11 +1058,11 @@ class App:
             if not text:
                 play_sound(self.cfg, "error")
                 self.ui.say("Не расслышал – попробуйте ещё раз")
-                threading.Timer(3, self.ui.hide_panel).start()
+                self._hide_later(3)
                 return
             self.paste(text)
             self.ui.say("Вставлено", "green")
-            threading.Timer(2, self.ui.hide_panel).start()
+            self._hide_later(2)
         except Exception:
             log(traceback.format_exc())
             play_sound(self.cfg, "error")
@@ -1123,7 +1135,7 @@ class App:
             play_sound(self.cfg, "ready")
             self.ui.set_status("")
             self.ui.say(f"Диктовка {APP_VERSION} готова — зажмите {self.key} и говорите", "green")
-            threading.Timer(10, self.ui.hide_panel).start()
+            self._hide_later(10)
         except Exception:
             log(traceback.format_exc())
             self.ui.say("Модель не загрузилась — см. журнал", "red")
