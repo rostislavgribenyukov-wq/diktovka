@@ -5,7 +5,7 @@
 
 import os, sys, json, time, math, struct, threading, subprocess, traceback
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 REPO = "rostislavgribenyukov-wq/diktovka"   # отсюда скачиваются обновления
 PLATFORM = "mac" if sys.platform == "darwin" else "win"
 
@@ -124,6 +124,8 @@ def transcribe(model, audio, cfg):
         r = m.transcribe(
             audio, path_or_hf_repo=f"mlx-community/whisper-{cfg['model']}",
             language=cfg["language"], initial_prompt=cfg.get("prompt") or None,
+            # без повторных попыток с другой «температурой» (на шуме они растягивали ответ до 40+ с)
+            temperature=0.0, condition_on_previous_text=False,
         )
         return (r.get("text") or "").strip()
     segs, _ = m.transcribe(
@@ -352,6 +354,22 @@ if PLATFORM == "mac":
                 NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                     ((b.origin.x, b.origin.y), (w, h)), h / 2, h / 2).fill()
 
+    class _TextView(NSView):
+        """Текст плашки: рисуется в заданной точке (низ строки), без отступов поля ввода."""
+        def initWithFrame_(self, frame):
+            self = objc.super(_TextView, self).initWithFrame_(frame)
+            self._s = None
+            self._pt = (0.0, 0.0)
+            return self
+
+        def setText_at_(self, s, pt):
+            self._s, self._pt = s, pt
+            self.setNeedsDisplay_(True)
+
+        def drawRect_(self, rect):
+            if self._s is not None:
+                self._s.drawAtPoint_(self._pt)
+
     class _SpinnerView(NSView):
         """Плавный круговой индикатор «обработка»."""
         def initWithFrame_(self, frame):
@@ -527,19 +545,12 @@ if PLATFORM == "mac":
             spinner = _SpinnerView.alloc().initWithFrame_(((17, 23), (16, 16)))
             spinner.setHidden_(True)
             bg.addSubview_(spinner)
-            label = NSTextField.alloc().initWithFrame_(((38, 19), (W - 50, 24)))
             try:
-                label.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightMedium))
+                self._font = NSFont.systemFontOfSize_weight_(13, NSFontWeightMedium)
             except Exception:
-                label.setFont_(NSFont.systemFontOfSize_(13))
-            label.setAlignment_(0)
-            # метка, а не поле ввода: без рамки/фона и без переноса (иначе хвост строки уходит вниз и обрезается)
-            label.setBezeled_(False)
-            label.setDrawsBackground_(False)
-            label.setEditable_(False)
-            label.setSelectable_(False)
-            label.cell().setWraps_(False)
-            label.cell().setLineBreakMode_(2)  # NSLineBreakByClipping
+                self._font = NSFont.systemFontOfSize_(13)
+            # текст рисуем сами (не NSTextField): точная позиция по краям букв и базовой линии, без скрытых отступов
+            label = _TextView.alloc().initWithFrame_(((0, 0), (W, H)))
             bg.addSubview_(label)
             level = _LevelBar.alloc().initWithFrame_(((20, 10), (W - 40, 4)))
             bg.addSubview_(level)
@@ -575,14 +586,21 @@ if PLATFORM == "mac":
                 shadow.setShadowOffset_((0, -1.5))
                 shadow.setShadowBlurRadius_(4)
                 shadow.setShadowColor_(NSColor.blackColor().colorWithAlphaComponent_(0.8))
-                attrs = {"NSFont": label.font(), "NSColor": NSColor.whiteColor(), "NSShadow": shadow}
+                font = self._font
+                attrs = {"NSFont": font, "NSColor": NSColor.whiteColor(), "NSShadow": shadow}
                 from Foundation import NSMutableAttributedString
                 astr = NSMutableAttributedString.alloc().initWithString_attributes_(text, attrs)
-                label.setAttributedStringValue_(astr)
                 tw = math.ceil(astr.size().width)
+                # реальные края букв (а не метрика строки): иначе справа остаётся лишний зазор
+                try:
+                    ib = astr.boundingRectWithSize_options_((10000, 100), 1 << 3)  # UsesDeviceMetrics
+                    ink_l, ink_w = ib.origin.x, ib.size.width
+                except Exception:
+                    ink_l, ink_w = 0.0, float(tw)
                 # плашка подстраивает ширину под текст (не больше 640 pt) и остаётся по центру
-                d, gap = 10.0, 8.0
-                total = d + gap + tw
+                busy = state == "busy"
+                d, gap = (14.0 if busy else 10.0), 8.0  # видимая ширина спиннера 14 pt, точки 10 pt
+                total = d + gap + ink_w
                 pw = panel.frame().size.width
                 need = int(min(640, max(self.OW, total + 36)))
                 if abs(need - pw) > 1:
@@ -596,12 +614,13 @@ if PLATFORM == "mac":
                 # симметрия: группа «точка + текст» строго по центру плашки
                 x0 = max(16.0, (pw - total) / 2)
                 cy = 34.0 if state == "record" else self.OH / 2  # место под полосу уровня только при записи
-                self._dot.setFrame_(((x0, cy - d / 2), (d, d)))
-                self._spinner.setFrame_(((x0 - 3, cy - 8), (16, 16)))
-                # ячейка поля даёт ~2 pt отступа с каждой стороны: сдвигаем на -2 и берём запас справа
-                label.setFrame_(((x0 + d + gap - 2, cy - 12), (tw + 8, 24)))
+                self._dot.setFrame_(((x0, cy - 5), (10, 10)))
+                self._spinner.setFrame_(((x0 - 1, cy - 8), (16, 16)))  # дуга рисуется на 1 pt внутри рамки
+                # центр заглавных букв — на уровне центра точки; низ строки = базовая линия минус спуск шрифта
+                label.setFrame_(((0, 0), (pw, self.OH)))
+                base = cy - font.capHeight() / 2
+                label.setText_at_(astr, (x0 + d + gap - ink_l, base + font.descender()))
                 self._dot.setColor_(self._dot_color(color))
-                busy = state == "busy"
                 if self._spinner.isAnimating() != busy:
                     (self._spinner.startAnimating if busy else self._spinner.stopAnimating)()
                 self._spinner.setHidden_(not busy)
@@ -1007,12 +1026,16 @@ class App:
                 send_enter()
             except Exception as e:
                 log("enter:", e)
-        time.sleep(1.2)
         if old is not None:
-            try:
-                pyperclip.copy(old)
-            except Exception:
-                pass
+            # возвращаем буфер обмена позже, в фоне: плашка не ждёт и сразу показывает «Вставлено»
+            def restore():
+                try:
+                    pyperclip.copy(old)
+                except Exception:
+                    pass
+            t = threading.Timer(1.2, restore)
+            t.daemon = True
+            t.start()
 
     def load(self):
         try:
