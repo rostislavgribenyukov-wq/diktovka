@@ -5,7 +5,7 @@
 
 import os, sys, json, time, math, struct, threading, subprocess, traceback
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 REPO = "rostislavgribenyukov-wq/diktovka"   # отсюда скачиваются обновления
 PLATFORM = "mac" if sys.platform == "darwin" else "win"
 
@@ -325,7 +325,7 @@ if PLATFORM == "mac":
             NSBezierPath.bezierPathWithOvalInRect_(self.bounds()).fill()
 
     class _LevelBar(NSView):
-        """Плавная полоса уровня звука: системные цвета, адаптируется под тему."""
+        """Тонкая полоса уровня звука — акцент, а не залитая полоса."""
         def initWithFrame_(self, frame):
             self = objc.super(_LevelBar, self).initWithFrame_(frame)
             self._v = 0.0
@@ -338,17 +338,17 @@ if PLATFORM == "mac":
         def drawRect_(self, rect):
             b = self.bounds()
             h = b.size.height
-            NSColor.labelColor().colorWithAlphaComponent_(0.12).set()
+            NSColor.labelColor().colorWithAlphaComponent_(0.10).set()
             NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(b, h / 2, h / 2).fill()
             if self._v > 0.01:
                 w = b.size.width * self._v
-                if self._v < 0.6:
+                if self._v < 0.7:
                     c = NSColor.systemGreenColor()
-                elif self._v < 0.85:
+                elif self._v < 0.9:
                     c = NSColor.systemOrangeColor()
                 else:
                     c = NSColor.systemRedColor()
-                c.colorWithAlphaComponent_(0.95).set()
+                c.colorWithAlphaComponent_(0.85).set()
                 NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                     ((b.origin.x, b.origin.y), (w, h)), h / 2, h / 2).fill()
 
@@ -533,13 +533,21 @@ if PLATFORM == "mac":
             except Exception:
                 label.setFont_(NSFont.systemFontOfSize_(13))
             label.setAlignment_(0)
+            # метка, а не поле ввода: без рамки/фона и без переноса (иначе хвост строки уходит вниз и обрезается)
+            label.setBezeled_(False)
+            label.setDrawsBackground_(False)
+            label.setEditable_(False)
+            label.setSelectable_(False)
+            label.cell().setWraps_(False)
+            label.cell().setLineBreakMode_(2)  # NSLineBreakByClipping
             bg.addSubview_(label)
-            level = _LevelBar.alloc().initWithFrame_(((16, 11), (W - 32, 5)))
+            level = _LevelBar.alloc().initWithFrame_(((20, 10), (W - 40, 4)))
             bg.addSubview_(level)
 
             screen = NSScreen.mainScreen().frame()
             panel.setFrameOrigin_(((screen.size.width - W) / 2, 120))
             self._panel, self._label, self._level, self._dot, self._spinner = panel, label, level, dot, spinner
+            self._bg = bg
 
         def _dot_color(self, color):
             if color == "red":
@@ -571,15 +579,27 @@ if PLATFORM == "mac":
                 from Foundation import NSMutableAttributedString
                 astr = NSMutableAttributedString.alloc().initWithString_attributes_(text, attrs)
                 label.setAttributedStringValue_(astr)
-                # симметрия: группа «точка + текст» строго по центру плашки
-                tw = astr.size().width
+                tw = math.ceil(astr.size().width)
+                # плашка подстраивает ширину под текст (не больше 640 pt) и остаётся по центру
                 d, gap = 10.0, 8.0
                 total = d + gap + tw
-                x0 = max(16.0, (self.OW - total) / 2)
-                cy = 34.0
+                pw = panel.frame().size.width
+                need = int(min(640, max(self.OW, total + 36)))
+                if abs(need - pw) > 1:
+                    from AppKit import NSScreen
+                    screen = NSScreen.mainScreen().frame()
+                    panel.setFrame_display_(
+                        (((screen.size.width - need) / 2, panel.frame().origin.y), (need, self.OH)), False)
+                    self._bg.setFrame_(((0, 0), (need, self.OH)))
+                    self._level.setFrame_(((20, 10), (need - 40, 4)))
+                    pw = need
+                # симметрия: группа «точка + текст» строго по центру плашки
+                x0 = max(16.0, (pw - total) / 2)
+                cy = 34.0 if state == "record" else self.OH / 2  # место под полосу уровня только при записи
                 self._dot.setFrame_(((x0, cy - d / 2), (d, d)))
                 self._spinner.setFrame_(((x0 - 3, cy - 8), (16, 16)))
-                label.setFrame_(((x0 + d + gap, cy - 12), (min(tw + 4, self.OW - 16), 24)))
+                # ячейка поля даёт ~2 pt отступа с каждой стороны: сдвигаем на -2 и берём запас справа
+                label.setFrame_(((x0 + d + gap - 2, cy - 12), (tw + 8, 24)))
                 self._dot.setColor_(self._dot_color(color))
                 busy = state == "busy"
                 if self._spinner.isAnimating() != busy:
@@ -740,8 +760,8 @@ else:
             v = max(0.0, min(1.0, v))
             self._c.coords(self._lvl_fg, 28, 50, 28 + v * (W - 56), 50)
             self._c.itemconfigure(self._lvl_fg,
-                                  fill="#ff6b6b" if v > 0.85 else
-                                       ("#ffd54f" if v > 0.6 else "#7ee787"))
+                                  fill="#ff6b6b" if v > 0.9 else
+                                       ("#ffd54f" if v > 0.7 else "#7ee787"))
 
         def _poll(self):
             try:
@@ -1013,7 +1033,7 @@ class App:
             play_sound(self.cfg, "ready")
             self.ui.set_status("")
             self.ui.say(f"Диктовка {APP_VERSION} готова — зажмите {self.key} и говорите", "green")
-            threading.Timer(4, self.ui.hide_panel).start()
+            threading.Timer(10, self.ui.hide_panel).start()
         except Exception:
             log(traceback.format_exc())
             self.ui.say("Модель не загрузилась — см. журнал", "red")
