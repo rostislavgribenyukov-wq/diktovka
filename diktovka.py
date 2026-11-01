@@ -5,7 +5,7 @@
 
 import os, sys, json, time, math, struct, threading, subprocess, traceback
 
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 REPO = "rostislavgribenyukov-wq/diktovka"   # отсюда скачиваются обновления
 PLATFORM = "mac" if sys.platform == "darwin" else "win"
 
@@ -117,20 +117,21 @@ def trim_silence(audio, sr=16000, thresh=0.008, pad=0.15):
     return audio[s:e]
 
 
-def transcribe(model, audio, cfg):
+def transcribe(model, audio, cfg, prompt=None):
     audio = trim_silence(audio)
     kind, m = model
+    prompt = (cfg.get("prompt") if prompt is None else prompt) or None
     if kind == "mlx":
         r = m.transcribe(
             audio, path_or_hf_repo=f"mlx-community/whisper-{cfg['model']}",
-            language=cfg["language"], initial_prompt=cfg.get("prompt") or None,
+            language=cfg["language"], initial_prompt=prompt,
             # без повторных попыток с другой «температурой» (на шуме они растягивали ответ до 40+ с)
             temperature=0.0, condition_on_previous_text=False,
         )
         return (r.get("text") or "").strip()
     segs, _ = m.transcribe(
         audio, language=cfg["language"], beam_size=3, vad_filter=True,
-        initial_prompt=cfg.get("prompt") or None, condition_on_previous_text=False,
+        initial_prompt=prompt, condition_on_previous_text=False,
     )
     return " ".join(s.text.strip() for s in segs).strip()
 
@@ -868,6 +869,64 @@ class App:
         self.lock = threading.Lock()
         self.key = {"cmd_r": "правый ⌘", "cmd_l": "левый ⌘"}.get(cfg["hotkey"], cfg["hotkey"])
         self._peak = 0.0
+        # одна очередь на модель: куски фразы распознаются по порядку, пока человек ещё говорит
+        from concurrent.futures import ThreadPoolExecutor
+        self.pool = ThreadPoolExecutor(max_workers=1)
+        self._jobs, self._acc, self._done, self._streamer = [], "", 0, None
+
+    # --- распознавание кусками во время речи ---
+    def _submit(self, audio):
+        import numpy as np
+        speech = trim_silence(audio)
+        if len(speech) < int(16000 * 0.4) or float(np.abs(speech).max()) < 0.05:
+            return  # тишина/шум — модель на них выдумывает текст
+        self._jobs.append(self.pool.submit(self._run_chunk, audio))
+
+    def _run_chunk(self, audio):
+        try:
+            # хвост уже распознанного — как подсказка модели: сохраняет стиль, заглавные и знаки
+            text = transcribe(self.model, audio, self.cfg, prompt=self._acc[-200:] or None)
+        except Exception:
+            log("кусок:", traceback.format_exc()[-300:])
+            return ""
+        if text:
+            self._acc = (self._acc + " " + text).strip()
+        return text
+
+    def _stream_loop(self):
+        # shortcut: «пауза» = пик тише 0.02 за 0.6 с; в очень шумной комнате режем только принудительно (25 с)
+        import numpy as np
+        sr = 16000
+        while self.recording:
+            time.sleep(0.25)
+            n = len(self.chunks)
+            if not n:
+                continue
+            pend = np.concatenate(self.chunks[:n])[self._done:]
+            if len(pend) < 3 * sr:
+                continue
+            cut = 0
+            if float(np.abs(pend[-int(0.6 * sr):]).max()) < 0.02:
+                cut = len(pend)
+            elif len(pend) > 25 * sr:  # без пауз: режем в самом тихом месте последних 5 секунд
+                seg = pend[-5 * sr:]
+                blocks = np.abs(seg[:len(seg) // 1600 * 1600]).reshape(-1, 1600).max(axis=1)
+                cut = len(pend) - len(seg) + (int(blocks.argmin()) + 1) * 1600
+            if cut:
+                self._submit(pend[:cut])
+                self._done += cut
+
+    def _keepalive(self):
+        # без работы модель «остывает» и первая фраза после паузы считается 10+ секунд
+        import numpy as np
+        while True:
+            time.sleep(30)
+            if self.recording or self.busy:
+                continue
+            try:
+                self.pool.submit(transcribe, self.model, np.zeros(16000, dtype="float32"), self.cfg).result()
+            except Exception:
+                pass
 
     # --- запись по удержанию клавиши ---
     def hold_start(self):
@@ -910,6 +969,7 @@ class App:
             self.target_app = current_front_hwnd()
         self.chunks = []
         self._peak = 0.0
+        self._jobs, self._acc, self._done = [], "", 0
 
         def cb(indata, frames, t, status):
             import numpy as np
@@ -932,6 +992,8 @@ class App:
         self.ui.set_recording(True)
         self.ui.say(f"Говорите…   отпустите {self.key} — вставить", "red")
         threading.Thread(target=self._level_loop, daemon=True).start()
+        self._streamer = threading.Thread(target=self._stream_loop, daemon=True)
+        self._streamer.start()
         # сторож: если отпускание клавиши потерялось — автостоп через 3 минуты
         watchdog = threading.Timer(180.0, self._watchdog_stop)
         watchdog.daemon = True
@@ -976,8 +1038,11 @@ class App:
                 return
             self.ui.say("Распознаю…", "blue", level=1.0)
             t0 = time.time()
-            text = transcribe(self.model, audio, self.cfg)
-            log(f"{len(audio)/16000:.1f} с речи → {time.time()-t0:.1f} с: {text}")
+            if self._streamer is not None:
+                self._streamer.join(timeout=2)  # чтобы не было гонки за границу последнего куска
+            self._submit(audio[self._done:])
+            text = " ".join(t for t in (f.result() for f in self._jobs) if t).strip()
+            log(f"{len(audio)/16000:.1f} с речи → {time.time()-t0:.1f} с после отпускания: {text}")
             if not text:
                 play_sound(self.cfg, "error")
                 self.ui.say("Не расслышал – попробуйте ещё раз")
@@ -1053,6 +1118,8 @@ class App:
             t1 = time.time()
             transcribe(self.model, warm, self.cfg)
             log(f"прогрев модели за {time.time()-t1:.1f} с")
+            if kind == "mlx":  # на процессоре (Windows) держать «тёплой» нечего, только греть зря
+                threading.Thread(target=self._keepalive, daemon=True).start()
             play_sound(self.cfg, "ready")
             self.ui.set_status("")
             self.ui.say(f"Диктовка {APP_VERSION} готова — зажмите {self.key} и говорите", "green")
