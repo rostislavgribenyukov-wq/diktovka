@@ -5,7 +5,7 @@
 
 import os, sys, json, time, math, struct, threading, subprocess, traceback
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 REPO = "rostislavgribenyukov-wq/diktovka"   # отсюда скачиваются обновления
 PLATFORM = "mac" if sys.platform == "darwin" else "win"
 
