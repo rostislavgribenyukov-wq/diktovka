@@ -5,7 +5,7 @@
 
 import os, sys, json, time, math, struct, threading, subprocess, traceback
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 REPO = "rostislavgribenyukov-wq/diktovka"   # отсюда скачиваются обновления
 PLATFORM = "mac" if sys.platform == "darwin" else "win"
 
@@ -1012,7 +1012,7 @@ class App:
             log(f"прогрев модели за {time.time()-t1:.1f} с")
             play_sound(self.cfg, "ready")
             self.ui.set_status("")
-            self.ui.say(f"Диктовка готова — зажмите {self.key} и говорите", "green")
+            self.ui.say(f"Диктовка {APP_VERSION} готова — зажмите {self.key} и говорите", "green")
             threading.Timer(4, self.ui.hide_panel).start()
         except Exception:
             log(traceback.format_exc())

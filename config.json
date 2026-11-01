@@ -1,0 +1,9 @@
+{
+  "hotkey": "cmd_r",
+  "language": "ru",
+  "model": "large-v3-turbo",
+  "device": "auto",
+  "beep": true,
+  "auto_send": false,
+  "prompt": "Привет. Это голосовое сообщение на русском языке, с точками и запятыми."
+}
