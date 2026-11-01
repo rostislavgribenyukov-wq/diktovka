@@ -1,0 +1,10 @@
+venv/
+models/
+__pycache__/
+*.log
+.lock
+.diktovka_update
+snd_*.wav
+*.bak
+HANDOFF.md
+.DS_Store
